@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "itek-can"
+version = "0.1.0"
+description = "macOS driver for iTek USBCAN adapters, with python-can integration"
+requires-python = ">=3.10"
+dependencies = [
+    "pyusb>=1.0",
+    "python-can>=4.0",
+    "gmssl>=3.2",
+]
+
+[project.entry-points."can.interface"]
+itek = "itek_can.bus:ITeKBus"
