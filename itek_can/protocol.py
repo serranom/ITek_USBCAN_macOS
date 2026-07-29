@@ -4,7 +4,14 @@ iTek USBCAN protocol — command builders, frame pack/unpack, bitrate tables.
 Implements the legacy protocol (0x12/0x13 prefix, variable-length commands)
 used by VID 0x0471 / PID 0x1200 adapters.
 
-Reference: iTekon-usb C library (2018, "grool")
+References:
+  - iTekon-usb C library (2018, "grool") — original basis.
+  - Disassembly of the vendor's ``usbcan.dll`` (CANalyst 1.1.9.17) — corrects
+    the bitrate mechanism. See ``docs/PROTOCOL.md`` for the full command table.
+
+Key correction from the DLL RE: the CAN bitrate is set via the InitCAN command
+``0x12 0x03`` (SJA1000 BTR0/BTR1), NOT via ``0x12 0x23`` (which the firmware
+NACKs). See ``cmd_init_can`` below.
 """
 
 import struct
@@ -66,6 +73,20 @@ BITRATES = {
     1_000_000: 0x00120005,
 }
 
+# SJA1000-style bit-timing registers (Timing0/Timing1), as consumed by the
+# vendor DLL's InitCAN command (0x12 0x03).  Standard 16 MHz table.
+# Source: usbcan.dll VCI_InitCAN disassembly (reads pInitConfig->Timing0/Timing1).
+BTR_SJA1000 = {
+    1_000_000: (0x00, 0x14),
+    500_000:   (0x00, 0x1C),
+    250_000:   (0x01, 0x1C),
+    125_000:   (0x03, 0x1C),
+    100_000:   (0x04, 0x1C),
+    50_000:    (0x09, 0x1C),
+    20_000:    (0x18, 0x1C),
+    10_000:    (0x31, 0x1C),
+}
+
 
 # ── Command builders ────────────────────────────────────────────────────────
 
@@ -80,11 +101,58 @@ def cmd_auth_legacy(challenge: bytes) -> bytes:
     return bytes([0x13, 0xB0, 0x11, 0x00]) + challenge
 
 
+def cmd_init_can(channel: int, bitrate: int, mode: int = MODE_NORMAL) -> bytes:
+    """0x12 0x03 — InitCAN: set bit-timing (bitrate) + mode for a channel.
+
+    This is the REAL bitrate mechanism, recovered from usbcan.dll's VCI_InitCAN
+    (CANalyst 1.1.9.17).  The vendor tool sets the rate every session with this
+    command — there is no separate "flash write" and no Windows/ECANTools
+    dependency.  Replaces the bogus 0x12 0x23 path (see cmd_set_bitrate).
+
+    Send: [0x12, 0x03, 0x04, 0x00, cm, BTR0, BTR1]  (7 bytes)
+      cm   = (0x80 if listen-only) | (0x10 if channel == 1)
+      BTR0 = SJA1000 Timing0,  BTR1 = SJA1000 Timing1  (from BTR_SJA1000)
+    Success: resp[2] == 0x81.
+    """
+    if bitrate not in BTR_SJA1000:
+        raise ValueError(
+            f"Unsupported bitrate {bitrate}. "
+            f"Supported (InitCAN/SJA1000): {sorted(BTR_SJA1000.keys())}"
+        )
+    btr0, btr1 = BTR_SJA1000[bitrate]
+    cm = (0x80 if mode == MODE_LISTEN_ONLY else 0x00) | (0x10 if channel == 1 else 0x00)
+    return bytes([0x12, 0x03, 0x04, 0x00, cm, btr0, btr1])
+
+
+def cmd_set_acc_filter(
+    channel: int,
+    acc_code: int = 0x00000000,
+    acc_mask: int = 0xFFFFFFFF,
+    mode: int = MODE_NORMAL,
+) -> bytes:
+    """0x12 0x04 — set acceptance filter (AccCode/AccMask) for a channel.
+
+    Recovered from usbcan.dll's VCI_InitCAN (issued right after 0x12 0x03).
+    Defaults accept every frame.  Replaces the bogus 0x12 0x24 path.
+
+    Send: [0x12, 0x04, 0x0A, 0x00, cm2, AccCode[BE4], AccMask[BE4]]  (13 bytes)
+      cm2 = (0x40 if listen-only) | (0x10 if channel == 1)
+    """
+    cm2 = (0x40 if mode == MODE_LISTEN_ONLY else 0x00) | (0x10 if channel == 1 else 0x00)
+    return (
+        bytes([0x12, 0x04, 0x0A, 0x00, cm2])
+        + struct.pack(">I", acc_code & 0xFFFFFFFF)
+        + struct.pack(">I", acc_mask & 0xFFFFFFFF)
+    )
+
+
 def cmd_set_bitrate(channel: int, bitrate: int, mode: int = MODE_NORMAL) -> bytes:
     """0x12 0x23 — set bitrate and mode for a channel.
 
-    NOTE: This command is rejected (NACK) by firmware v791.
-    Kept for reference and for older firmware versions.
+    DEPRECATED / SUPERSEDED.  This opcode does not exist on FW v791 (it NACKs)
+    and is absent from the vendor DLL — it came from the 2018 "grool" C
+    reference.  Use ``cmd_init_can`` (0x12 0x03) instead.  Kept only as a
+    fallback for hypothetical older firmware.
 
     Send: [0x12, 0x23, 0x06, 0x00, mode_chan, BTR[4]]  (9 bytes)
       mode_chan = (mode << 7) | (channel << 4)
@@ -102,8 +170,8 @@ def cmd_set_bitrate(channel: int, bitrate: int, mode: int = MODE_NORMAL) -> byte
 def cmd_set_filter(channel: int, index: int) -> bytes:
     """0x12 0x24 — set filter for a channel.
 
-    NOTE: This command is rejected (NACK) by firmware v791.
-    Kept for reference and for older firmware versions.
+    DEPRECATED / SUPERSEDED by ``cmd_set_acc_filter`` (0x12 0x04). This opcode
+    NACKs on FW v791 and is absent from the vendor DLL. Kept as a fallback.
 
     Send: [0x12, 0x24, 0x0B, index, flags, 0x00×9]  (14 bytes)
       byte[3] = filter index (0-13)

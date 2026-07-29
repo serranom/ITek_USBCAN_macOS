@@ -27,9 +27,9 @@ class ITeKBus(can.BusABC):
     channel : int
         CAN channel index (usually 0).
     bitrate : int
-        Arbitration bitrate in bps (e.g. 500_000).
-        NOTE: On firmware v791, the device ignores this and uses its
-        pre-configured bitrate (set via ECANTools on Windows).
+        Arbitration bitrate in bps (e.g. 250_000, 500_000).
+        Set per-session via InitCAN (0x12 0x03); supported rates are the
+        keys of ``protocol.BTR_SJA1000``. No Windows/ECANTools step needed.
     device : int
         USB device index when multiple adapters are connected.
     mode : str
