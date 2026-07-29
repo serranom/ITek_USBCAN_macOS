@@ -30,7 +30,10 @@ from .protocol import (
     FRAME_SIZE,
     MAX_FRAMES_PER_TX,
     MODE_NORMAL,
+    BTR_SJA1000,
     cmd_auth_legacy,
+    cmd_init_can,
+    cmd_set_acc_filter,
     cmd_set_bitrate,
     cmd_set_filter,
     cmd_start,
@@ -215,60 +218,62 @@ class ITeKDevice:
         bitrate: int,
         mode: int = MODE_NORMAL,
     ) -> None:
-        """Configure a CAN channel (bitrate + filters).
+        """Configure a CAN channel (bitrate + acceptance filter).
 
-        On firmware v791, the SET_BITRATE (0x12 0x23) and SET_FILTER (0x12 0x24)
-        commands are not supported and will be skipped. The device uses whatever
-        bitrate is stored in its flash memory (configured via ECANTools on Windows).
+        Primary path uses InitCAN (0x12 0x03) with SJA1000 BTR0/BTR1 — the
+        mechanism recovered from the vendor's usbcan.dll (see docs/PROTOCOL.md).
+        This sets the rate per-session directly from the host; no Windows /
+        ECANTools step is required.
 
-        On older firmware, these commands work normally.
+        Falls back to the legacy SET_BITRATE (0x12 0x23) only if InitCAN is
+        rejected, then reads the rate back so a mismatch is at least visible.
         """
-        # Try SET_BITRATE — may fail on newer firmware
-        try:
-            resp = self.send_command(cmd_set_bitrate(channel, bitrate, mode))
-            if check_response_ok(resp):
-                logger.info("Bitrate set to %d bps on channel %d", bitrate, channel)
-            else:
-                # Read back the actual bitrate from the device
-                actual = self.get_bitrate()
-                if actual and actual != bitrate:
-                    logger.warning(
-                        "SET_BITRATE rejected by firmware. "
-                        "Device is configured at %d bps (requested %d). "
-                        "Use ECANTools on Windows to change the stored bitrate.",
-                        actual, bitrate,
-                    )
-                elif actual:
-                    logger.info(
-                        "SET_BITRATE not supported, but device is already at %d bps",
-                        actual,
-                    )
-                else:
-                    logger.warning(
-                        "SET_BITRATE rejected and could not read back bitrate. "
-                        "Use ECANTools on Windows to configure."
-                    )
-        except Exception as e:
-            logger.warning("SET_BITRATE failed: %s — using device default", e)
-
-        # Try SET_FILTER × 14 — may fail on newer firmware
-        filters_ok = True
-        for i in range(14):
+        # Primary: InitCAN (0x12 0x03) — the real bitrate mechanism.
+        init_ok = False
+        if bitrate in BTR_SJA1000:
             try:
-                resp = self.send_command(cmd_set_filter(channel, i))
-                if not check_response_ok(resp):
-                    if i == 0:
-                        logger.debug(
-                            "SET_FILTER not supported by firmware — using device defaults."
-                        )
-                    filters_ok = False
-                    break
-            except usb.core.USBError:
-                filters_ok = False
-                break
+                resp = self.send_command(cmd_init_can(channel, bitrate, mode))
+                if check_response_ok(resp):
+                    init_ok = True
+                    logger.info(
+                        "InitCAN OK: bitrate %d bps on channel %d (BTR %02X %02X)",
+                        bitrate, channel, *BTR_SJA1000[bitrate],
+                    )
+                    # Acceptance filter: accept-all (AccCode 0 / AccMask all-1s).
+                    fresp = self.send_command(cmd_set_acc_filter(channel, mode=mode))
+                    if check_response_ok(fresp):
+                        logger.info("Acceptance filter set (accept-all) on ch %d", channel)
+                    else:
+                        logger.debug("Acceptance filter NACK on ch %d (non-fatal)", channel)
+                else:
+                    logger.warning("InitCAN (0x12 0x03) NACK: %s", resp.hex())
+            except usb.core.USBError as e:
+                logger.warning("InitCAN failed: %s", e)
+        else:
+            logger.warning(
+                "No SJA1000 BTR entry for %d bps; skipping InitCAN.", bitrate
+            )
 
-        if filters_ok:
-            logger.info("Filters configured on channel %d", channel)
+        # Fallback: legacy SET_BITRATE (0x12 0x23) for hypothetical old firmware.
+        if not init_ok:
+            try:
+                resp = self.send_command(cmd_set_bitrate(channel, bitrate, mode))
+                if check_response_ok(resp):
+                    logger.info("Legacy SET_BITRATE accepted at %d bps", bitrate)
+                    init_ok = True
+            except Exception as e:
+                logger.debug("Legacy SET_BITRATE failed: %s", e)
+
+        # Report the device's view of the rate (best-effort readback).
+        actual = self.get_bitrate()
+        if actual and actual != bitrate:
+            logger.warning(
+                "Bitrate readback is %d bps but %d was requested — "
+                "verify BTR values / clock on a known-good bus.",
+                actual, bitrate,
+            )
+        elif not init_ok and actual:
+            logger.info("Bitrate not set by host; device reports %d bps.", actual)
 
     # ── Start / Stop ────────────────────────────────────────────────────────
 
