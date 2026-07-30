@@ -104,7 +104,7 @@ convention). Standard 16 MHz table:
 | Op | Bytes | Status |
 |---|---|---|
 | SM4 auth | `13 B0 11 00  <challenge[16]>` → verify `resp[4:20]==SM4_ECB("itekon2012usbcan", challenge)` | ✅ required by FW v791 |
-| Read config (bitrate readback) | `12 06 01 00` → SJA1000 BTR bytes at data[6]/data[7] | ✅ works on FW v791 |
+| Read config (bitrate readback) | `12 06 01 00` → SJA1000 BTR bytes at data[6]/data[7] | ⚠️ works, but returns the **flash default only** — static, does NOT reflect an InitCAN-set session rate (see below) |
 | Read status | `12 0D 01 00` | ⚠️ used by driver, not seen in DLL |
 
 ### ❌ Superseded / incorrect (were in this driver, from the 2018 "grool" C ref)
@@ -138,5 +138,22 @@ The bench runs **250 kbps classic CAN**. This adapter ships flash-defaulted to
 Windows" — was a side effect of sending the wrong opcode (`0x12 0x23`, which
 NACKs). The vendor tool sets the rate every session via **`0x12 0x03`**, so this
 driver can set 250 kbps directly from macOS: send
-`12 03 04 00 00 01 1C` (channel 0, normal, 250k), then start. Confirm on the
-bench against a known-250k node before trusting it.
+`12 03 04 00 00 01 1C` (channel 0, normal, 250k), then start.
+
+### On-hardware test (FW v791, HW v513) — 2026-07-29
+
+Confirmed with the adapter on USB (no bus attached):
+
+- `12 03 04 00 00 01 1c` (InitCAN 250k) → **ACK** `12 03 81 00`.
+- `12 04 0a 00 00 00000000 ffffffff` (accept-all filter) → **ACK** `12 04 81 00`.
+- Legacy `12 23 …` (old SET_BITRATE) → **NACK** `12 23 00`. ← the original bug.
+- `12 06 …` (get_config) returns `…95 03…` (→ 500k) **unchanged** for every
+  InitCAN rate, before and after StartCAN. So get_config = flash default; it
+  **cannot** verify the InitCAN session rate.
+
+**Open item:** whether InitCAN retunes the *live* controller (very likely — it
+is the only rate mechanism the vendor tool uses, and it never reads back) or is
+a no-op for rate on this firmware can only be settled with a **second node on
+the bus**. Bench test: wire the adapter to the Dock (250 kbps), `InitCAN 250k`,
+and check for clean ACKs / no bus-off. If it fails, fall back to re-flashing the
+adapter to 250k with ECANTools on Windows.

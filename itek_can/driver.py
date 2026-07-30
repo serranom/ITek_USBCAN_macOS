@@ -196,10 +196,14 @@ class ITeKDevice:
     # ── Bitrate readback ───────────────────────────────────────────────────
 
     def get_bitrate(self) -> int:
-        """Read the device's current bitrate from the GET_CONFIG registers.
+        """Read the device's FLASH-STORED default bitrate from GET_CONFIG.
 
-        Parses the SJA1000-style BTR0/BTR1 bytes in the GET_CONFIG response
-        using a 36 MHz CAN peripheral clock (typical for STM32-based adapters).
+        Parses the SJA1000-style BTR0/BTR1 bytes in the GET_CONFIG (0x12 0x06)
+        response using a 36 MHz CAN peripheral clock.
+
+        WARNING: on FW v791 this reflects the flash default only — it does NOT
+        change when the session rate is set via InitCAN (0x12 0x03). Use it to
+        read the manufactured default, not to verify a host-set rate.
 
         Returns the bitrate in bps, or 0 if it can't be determined.
         """
@@ -264,16 +268,21 @@ class ITeKDevice:
             except Exception as e:
                 logger.debug("Legacy SET_BITRATE failed: %s", e)
 
-        # Report the device's view of the rate (best-effort readback).
+        # NOTE: get_config (0x12 0x06) returns the FLASH-STORED default rate, not
+        # the live rate set by InitCAN — verified on FW v791, it never changes
+        # when InitCAN is issued. It can confirm the flash default but cannot
+        # verify the session rate; do that against a known-good node on the bus.
         actual = self.get_bitrate()
-        if actual and actual != bitrate:
-            logger.warning(
-                "Bitrate readback is %d bps but %d was requested — "
-                "verify BTR values / clock on a known-good bus.",
-                actual, bitrate,
-            )
-        elif not init_ok and actual:
-            logger.info("Bitrate not set by host; device reports %d bps.", actual)
+        if init_ok:
+            if actual and actual != bitrate:
+                logger.info(
+                    "InitCAN requested %d bps (session). Flash-default readback "
+                    "still reports %d bps — expected; confirm the live rate on a "
+                    "real bus (get_config does not reflect InitCAN).",
+                    bitrate, actual,
+                )
+        elif actual:
+            logger.warning("Bitrate not set by host; device reports %d bps.", actual)
 
     # ── Start / Stop ────────────────────────────────────────────────────────
 
