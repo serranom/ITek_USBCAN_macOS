@@ -94,6 +94,10 @@ class ITeKDevice:
             pass
 
         usb.util.claim_interface(self._dev, 0)
+        # Clear any stale TX-ACKs left in EP 0x81 by a prior session so the
+        # first command (SM4 auth) does not read leftover bytes and fail.
+        with self._lock:
+            self._drain_int_in()
         logger.info(
             "iTek device opened (index %d, VID:PID %04X:%04X)",
             device_index, dev.idVendor, dev.idProduct,
@@ -120,12 +124,50 @@ class ITeKDevice:
 
     # ── Command channel ─────────────────────────────────────────────────────
 
-    def send_command(self, cmd: bytes, timeout: int = USB_TIMEOUT_MS) -> bytes:
-        """Send a command on the interrupt endpoint and return the response."""
+    def _drain_int_in(self, settle_ms: int = 20) -> int:
+        """Discard stale bytes on the interrupt-IN endpoint (EP 0x81).
+
+        EP 0x81 is shared by command responses AND bulk-TX acknowledgements, so
+        a late/unread TX-ACK can be left sitting in the buffer. Draining it at
+        session boundaries (open/close) and after TX keeps the next
+        command/response exchange in sync. Reads until `settle_ms` of silence.
+        Must be called with `self._lock` held (or before the RX thread starts).
+        """
+        n = 0
+        while True:
+            try:
+                self._dev.read(EP_INT_IN, 64, timeout=settle_ms)
+                n += 1
+            except usb.core.USBError:  # USBTimeoutError subclasses USBError
+                break
+        return n
+
+    def send_command(self, cmd: bytes, timeout: int = USB_TIMEOUT_MS,
+                     match_echo: bool = True) -> bytes:
+        """Send a command on EP 0x01 and return the matching response from EP 0x81.
+
+        The device echoes the command's ``[class, sub]`` opcode in bytes 0-1 of
+        its response (e.g. ``12 03`` -> ``12 03 81 00``). Because EP 0x81 also
+        carries TX-ACKs, we discard any frame whose opcode does not match the
+        command until the real response arrives (or the timeout elapses). This
+        stops an in-flight TX-ACK from being mistaken for the command reply.
+        """
         with self._lock:
             self._dev.write(EP_INT_OUT, cmd, timeout=timeout)
-            resp = self._dev.read(EP_INT_IN, 64, timeout=timeout)
-            return bytes(resp)
+            deadline = time.monotonic() + timeout / 1000.0
+            last = b""
+            while True:
+                try:
+                    resp = bytes(self._dev.read(EP_INT_IN, 64, timeout=timeout))
+                except usb.core.USBError:
+                    return last
+                if not match_echo or len(cmd) < 2:
+                    return resp
+                if len(resp) >= 2 and resp[0] == cmd[0] and resp[1] == cmd[1]:
+                    return resp
+                last = resp  # stale (e.g. a TX-ACK) — skip and keep reading
+                if time.monotonic() >= deadline:
+                    return resp
 
     # ── Authentication ──────────────────────────────────────────────────────
 
@@ -135,13 +177,17 @@ class ITeKDevice:
         Uses the legacy 0x13 0xB0 format (only format supported by this hardware).
         The SM4 key is hardcoded: b"itekon2012usbcan".
         """
-        challenge = os.urandom(16)
-        expected = sm4_encrypt_ecb(challenge)
-        resp = self.send_command(cmd_auth_legacy(challenge))
-
-        if len(resp) >= 20 and resp[4:20] == expected[:16]:
-            logger.info("SM4 authentication OK")
-            return
+        for attempt in range(1, 4):
+            with self._lock:
+                self._drain_int_in()
+            challenge = os.urandom(16)
+            expected = sm4_encrypt_ecb(challenge)
+            resp = self.send_command(cmd_auth_legacy(challenge))
+            if len(resp) >= 20 and resp[4:20] == expected[:16]:
+                logger.info("SM4 authentication OK (attempt %d)", attempt)
+                return
+            logger.debug("SM4 auth attempt %d failed (resp=%s)", attempt, resp.hex())
+            time.sleep(0.05)
 
         raise can.CanInitializationError(
             "SM4 authentication failed — wrong key or unsupported firmware"
@@ -336,15 +382,10 @@ class ITeKDevice:
 
             self._dev.write(EP_BULK_OUT, payload, timeout=USB_TIMEOUT_MS)
 
-            # Read TX ACK from interrupt endpoint
-            # The old C driver does this after every bulk TX write
+            # Consume the TX-ACK(s) on EP 0x81 promptly (short settle) so they do
+            # not accumulate or bleed into the next command's response read.
             with self._lock:
-                try:
-                    self._dev.read(EP_INT_IN, 10, timeout=1000)
-                except usb.core.USBTimeoutError:
-                    logger.debug("TX ACK timeout (batch of %d frames)", len(batch))
-                except usb.core.USBError as e:
-                    logger.debug("TX ACK read error: %s", e)
+                self._drain_int_in(settle_ms=5)
 
     # ── RX ──────────────────────────────────────────────────────────────────
 
@@ -416,6 +457,14 @@ class ITeKDevice:
 
         if self._rx_thread and self._rx_thread.is_alive():
             self._rx_thread.join(timeout=2.0)
+
+        # Drain residual TX-ACKs so a subsequent open() + authenticate() starts
+        # from a clean EP 0x81 (prevents the reopen-after-TX auth wedge).
+        try:
+            with self._lock:
+                self._drain_int_in()
+        except usb.core.USBError:
+            pass
 
         try:
             usb.util.release_interface(self._dev, 0)
